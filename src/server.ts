@@ -4,7 +4,7 @@ import { Server } from 'socket.io'
 import cors from 'cors'
 import dotenv from 'dotenv'
 import { setupSocketHandlers } from './socket-handlers'
-
+import { setupClinRoutes, initClin } from './clin-chatbot'
 dotenv.config()
 
 const app = express()
@@ -41,6 +41,9 @@ const io = new Server(httpServer, {
 // Setup socket handlers
 setupSocketHandlers(io)
 
+// Setup Clin WhatsApp chatbot
+setupClinRoutes(app)
+
 const PORT = process.env.PORT || 3001
 
 httpServer.listen(PORT, () => {
@@ -48,6 +51,9 @@ httpServer.listen(PORT, () => {
     console.log(`📡 WebSocket: ws://localhost:${PORT}`)
     console.log(`🌐 HTTP: http://localhost:${PORT}`)
     console.log(`✅ Server running`)
+    
+    // Iniciar Clin após servidor estar rodando
+    initClin()
 })
 
 // Graceful shutdown
