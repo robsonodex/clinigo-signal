@@ -2,10 +2,10 @@
  * Clin WhatsApp Chatbot — Baileys Integration
  * 
  * Roda 24/7 dentro do servidor Railway.
- * Escuta mensagens recebidas no WhatsApp de vendas do CliniGo
- * e responde automaticamente usando a API do Clin.
- * 
- * Funciona independente da Vercel (serverless).
+ * SESSÃO ETERNA: reconecta infinitamente.
+ * Só desconecta se o usuário:
+ * 1. Desconectar manualmente do celular (loggedOut)
+ * 2. Chamar /clin/disconnect
  */
 
 import makeWASocket, {
@@ -33,6 +33,9 @@ let clinSocket: WASocket | null = null
 let clinStatus: 'disconnected' | 'connecting' | 'connected' = 'disconnected'
 let clinQrCode: string | null = null
 let clinPhoneNumber: string | null = null
+let reconnectAttempt = 0
+let manualDisconnect = false // Flag para diferenciar desconexão manual vs queda
+let keepAliveInterval: ReturnType<typeof setInterval> | null = null
 
 // Histórico de conversas in-memory
 const conversations = new Map<string, { role: string; content: string }[]>()
@@ -45,30 +48,49 @@ function getSupabase() {
   return createClient(url, key)
 }
 
+// ========== KEEP-ALIVE ==========
+function startKeepAlive() {
+  stopKeepAlive()
+  // Ping a cada 25s para manter a conexão viva
+  keepAliveInterval = setInterval(() => {
+    if (clinSocket && clinStatus === 'connected') {
+      try {
+        // Enviar presença para manter conexão
+        clinSocket.sendPresenceUpdate('available')
+      } catch (err) {
+        console.error('[Clin] KeepAlive error:', err)
+      }
+    }
+  }, 25_000)
+}
+
+function stopKeepAlive() {
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval)
+    keepAliveInterval = null
+  }
+}
+
 // ========== HANDLER DE MENSAGENS ==========
 async function handleIncomingMessage(socket: WASocket, senderJid: string, text: string) {
   const senderPhone = senderJid.split('@')[0]
 
-  // Obter ou criar histórico
   if (!conversations.has(senderPhone)) {
     conversations.set(senderPhone, [])
   }
   const history = conversations.get(senderPhone)!
   history.push({ role: 'user', content: text })
 
-  // Limitar histórico
   if (history.length > 20) {
     history.splice(0, history.length - 20)
   }
 
-  // Indicar que está digitando
   try {
     await socket.presenceSubscribe(senderJid)
     await socket.sendPresenceUpdate('composing', senderJid)
   } catch { /* best effort */ }
 
   try {
-    // Chamar API do Clin
     const response = await fetch(CLIN_API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -80,193 +102,218 @@ async function handleIncomingMessage(socket: WASocket, senderJid: string, text: 
       }),
     })
 
-    if (!response.ok) {
-      throw new Error(`API retornou ${response.status}`)
-    }
+    if (!response.ok) throw new Error(`API retornou ${response.status}`)
 
     const data = await response.json()
     const reply = data.reply || 'Desculpe, estou com dificuldade técnica. Tente novamente em instantes! 😊'
 
-    // Adicionar resposta ao histórico
     history.push({ role: 'assistant', content: reply })
 
-    // Parar digitação
-    try {
-      await socket.sendPresenceUpdate('paused', senderJid)
-    } catch { /* best effort */ }
+    try { await socket.sendPresenceUpdate('paused', senderJid) } catch { /* */ }
 
-    // Enviar resposta
     await socket.sendMessage(senderJid, { text: reply })
     console.log(`[Clin] ✅ Respondido para ${senderPhone}`)
 
   } catch (err) {
     console.error(`[Clin] ❌ Erro ao chamar API:`, err)
-
-    try {
-      await socket.sendPresenceUpdate('paused', senderJid)
-    } catch { /* best effort */ }
-
+    try { await socket.sendPresenceUpdate('paused', senderJid) } catch { /* */ }
     await socket.sendMessage(senderJid, {
       text: 'Oi! 😊 Estou com uma dificuldade técnica momentânea. Mas não se preocupe, nossa equipe já foi notificada e vai te atender em breve!'
     })
   }
 }
 
-// ========== INICIAR SESSÃO BAILEYS ==========
+// ========== INICIAR SESSÃO BAILEYS (SESSÃO ETERNA) ==========
 async function startClinSession() {
   if (clinStatus === 'connecting') return
+  if (manualDisconnect) return // Não reconectar se foi desconexão manual
+
   clinStatus = 'connecting'
   clinQrCode = null
 
-  // Garantir diretório de auth
   if (!fs.existsSync(AUTH_DIR)) {
     fs.mkdirSync(AUTH_DIR, { recursive: true })
   }
 
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
-  const { version } = await fetchLatestBaileysVersion()
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
+    const { version } = await fetchLatestBaileysVersion()
 
-  const socket = makeWASocket({
-    version,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger as any),
-    },
-    logger: logger as any,
-    printQRInTerminal: true, // Imprime QR no terminal do Railway (útil para debug)
-    browser: ['CliniGo Clin', 'Chrome', '120.0.0'],
-    generateHighQualityLinkPreview: false,
-    syncFullHistory: false,
-  })
+    const socket = makeWASocket({
+      version,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger as any),
+      },
+      logger: logger as any,
+      printQRInTerminal: true,
+      browser: ['CliniGo Clin', 'Chrome', '120.0.0'],
+      generateHighQualityLinkPreview: false,
+      syncFullHistory: false,
+      // Configurações para sessão eterna
+      keepAliveIntervalMs: 30_000, // Heartbeat do Baileys a cada 30s
+      retryRequestDelayMs: 500,
+      connectTimeoutMs: 60_000,
+      defaultQueryTimeoutMs: undefined, // Sem timeout de query
+      emitOwnEvents: false,
+    })
 
-  clinSocket = socket
+    clinSocket = socket
 
-  // ===== EVENTOS =====
+    // ===== CONNECTION EVENTS =====
+    socket.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
+      const { connection, lastDisconnect, qr } = update
 
-  socket.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
-    const { connection, lastDisconnect, qr } = update
-
-    if (qr) {
-      clinQrCode = qr // String raw do QR (não base64)
-      clinStatus = 'connecting'
-      console.log(`[Clin] 📱 QR Code gerado. Escaneie pelo endpoint /clin/qr`)
-    }
-
-    if (connection === 'open') {
-      clinStatus = 'connected'
-      clinQrCode = null
-      clinPhoneNumber = socket.user?.id?.split(':')[0] || socket.user?.id?.split('@')[0] || null
-      console.log(`[Clin] ✅ WhatsApp conectado (${clinPhoneNumber})`)
-
-      // Registrar no Supabase
-      const supabase = getSupabase()
-      if (supabase) {
-        await supabase.from('whatsapp_sessions').upsert({
-          clinic_id: 'clin-sales-bot',
-          instance_name: 'clin-railway',
-          status: 'connected',
-          phone_number: clinPhoneNumber,
-          connected_at: new Date().toISOString(),
-          qr_code: null,
-          error_message: null,
-          last_health_check: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        }, { onConflict: 'clinic_id' })
+      if (qr) {
+        clinQrCode = qr
+        clinStatus = 'connecting'
+        console.log(`[Clin] 📱 QR Code gerado — escaneie pelo /clin/qr`)
       }
-    }
 
-    if (connection === 'close') {
-      const statusCode = (lastDisconnect?.error as any)?.output?.statusCode
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+      if (connection === 'open') {
+        clinStatus = 'connected'
+        clinQrCode = null
+        reconnectAttempt = 0 // Reset do contador
+        clinPhoneNumber = socket.user?.id?.split(':')[0] || socket.user?.id?.split('@')[0] || null
+        console.log(`[Clin] ✅ WhatsApp CONECTADO ETERNAMENTE (${clinPhoneNumber})`)
 
-      console.log(`[Clin] Conexão fechada (code=${statusCode}, reconnect=${shouldReconnect})`)
-
-      clinSocket = null
-      clinQrCode = null
-
-      if (shouldReconnect) {
-        console.log(`[Clin] 🔄 Reconectando em 5s...`)
-        setTimeout(startClinSession, 5000)
-      } else {
-        clinStatus = 'disconnected'
-        clinPhoneNumber = null
-
-        // Limpar auth para forçar novo QR
-        if (fs.existsSync(AUTH_DIR)) {
-          fs.rmSync(AUTH_DIR, { recursive: true, force: true })
-        }
+        // Iniciar keep-alive
+        startKeepAlive()
 
         const supabase = getSupabase()
         if (supabase) {
-          await supabase.from('whatsapp_sessions').update({
-            status: 'disconnected',
-            disconnected_at: new Date().toISOString(),
+          await supabase.from('whatsapp_sessions').upsert({
+            clinic_id: 'clin-sales-bot',
+            instance_name: 'clin-railway',
+            status: 'connected',
+            phone_number: clinPhoneNumber,
+            connected_at: new Date().toISOString(),
             qr_code: null,
-            phone_number: null,
+            error_message: null,
+            last_health_check: new Date().toISOString(),
             updated_at: new Date().toISOString(),
-          }).eq('clinic_id', 'clin-sales-bot')
+          }, { onConflict: 'clinic_id' }).catch(() => {})
         }
       }
-    }
-  })
 
-  // Salvar credenciais
-  socket.ev.on('creds.update', saveCreds)
+      if (connection === 'close') {
+        stopKeepAlive()
+        clinSocket = null
+        clinQrCode = null
 
-  // ===== LISTENER DE MENSAGENS =====
-  socket.ev.on('messages.upsert', async (m) => {
-    for (const msg of m.messages) {
-      // Ignorar: mensagens nossas, grupos, broadcasts, status
-      if (msg.key.fromMe) continue
-      if (msg.key.remoteJid?.endsWith('@g.us')) continue
-      if (msg.key.remoteJid === 'status@broadcast') continue
+        const statusCode = (lastDisconnect?.error as any)?.output?.statusCode
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut
 
-      const text = msg.message?.conversation
-        || msg.message?.extendedTextMessage?.text
-        || ''
+        console.log(`[Clin] ⚠️ Conexão fechada (code=${statusCode}, loggedOut=${isLoggedOut})`)
 
-      if (!text.trim()) continue
+        if (isLoggedOut) {
+          // ÚNICO caso onde a sessão realmente morre:
+          // o usuário desconectou do celular (ou /clin/disconnect)
+          clinStatus = 'disconnected'
+          clinPhoneNumber = null
 
-      const senderJid = msg.key.remoteJid!
-      console.log(`[Clin] 📩 Mensagem de ${senderJid.split('@')[0]}: ${text.substring(0, 50)}`)
+          if (fs.existsSync(AUTH_DIR)) {
+            fs.rmSync(AUTH_DIR, { recursive: true, force: true })
+          }
 
-      try {
-        await handleIncomingMessage(socket, senderJid, text)
-      } catch (err) {
-        console.error(`[Clin] Erro ao processar mensagem:`, err)
+          const supabase = getSupabase()
+          if (supabase) {
+            await supabase.from('whatsapp_sessions').update({
+              status: 'disconnected',
+              disconnected_at: new Date().toISOString(),
+              qr_code: null,
+              phone_number: null,
+              updated_at: new Date().toISOString(),
+            }).eq('clinic_id', 'clin-sales-bot').catch(() => {})
+          }
+
+          console.log(`[Clin] 🔴 Sessão encerrada pelo celular. Escaneie novamente via /clin/qr.`)
+        } else {
+          // QUALQUER outro erro: reconecta SEMPRE, infinitamente
+          reconnectAttempt++
+          // Backoff: 2s, 4s, 8s, 16s, 30s (max 30s entre tentativas)
+          const delay = Math.min(2000 * Math.pow(2, reconnectAttempt - 1), 30_000)
+          
+          console.log(`[Clin] 🔄 Reconexão #${reconnectAttempt} em ${delay / 1000}s...`)
+          
+          clinStatus = 'connecting'
+          setTimeout(() => {
+            startClinSession().catch((err) => {
+              console.error('[Clin] Erro na reconexão:', err)
+              // Mesmo com erro, tenta de novo
+              setTimeout(() => startClinSession().catch(console.error), 10_000)
+            })
+          }, delay)
+        }
       }
-    }
-  })
+    })
 
-  console.log(`[Clin] 🤖 Listener de mensagens WhatsApp ativado`)
+    socket.ev.on('creds.update', saveCreds)
+
+    // ===== LISTENER DE MENSAGENS =====
+    socket.ev.on('messages.upsert', async (m) => {
+      for (const msg of m.messages) {
+        if (msg.key.fromMe) continue
+        if (msg.key.remoteJid?.endsWith('@g.us')) continue
+        if (msg.key.remoteJid === 'status@broadcast') continue
+
+        const text = msg.message?.conversation
+          || msg.message?.extendedTextMessage?.text
+          || ''
+
+        if (!text.trim()) continue
+
+        const senderJid = msg.key.remoteJid!
+        console.log(`[Clin] 📩 Mensagem de ${senderJid.split('@')[0]}: ${text.substring(0, 50)}`)
+
+        try {
+          await handleIncomingMessage(socket, senderJid, text)
+        } catch (err) {
+          console.error(`[Clin] Erro ao processar:`, err)
+        }
+      }
+    })
+
+    console.log(`[Clin] 🤖 Listener ativado — sessão eterna habilitada`)
+
+  } catch (err) {
+    console.error('[Clin] ❌ Erro ao criar sessão:', err)
+    clinStatus = 'disconnected'
+    
+    // Reconectar mesmo quando o startClinSession dá erro
+    const delay = Math.min(5000 * Math.pow(2, reconnectAttempt), 60_000)
+    reconnectAttempt++
+    console.log(`[Clin] 🔄 Tentando novamente em ${delay / 1000}s...`)
+    setTimeout(() => startClinSession().catch(console.error), delay)
+  }
 }
 
 // ========== EXPRESS ROUTES ==========
 export function setupClinRoutes(app: Express) {
-  // Status do Clin
-  app.get('/clin/status', (req, res) => {
+  app.get('/clin/status', (_req, res) => {
     res.json({
       status: clinStatus,
       phone_number: clinPhoneNumber,
       connected: clinStatus === 'connected',
       conversations_active: conversations.size,
+      reconnect_attempts: reconnectAttempt,
       uptime: process.uptime(),
     })
   })
 
-  // QR Code
-  app.get('/clin/qr', async (req, res) => {
+  app.get('/clin/qr', async (_req, res) => {
     if (clinStatus === 'connected') {
       return res.json({ status: 'connected', qr: null, phone_number: clinPhoneNumber })
     }
 
-    // Se não tem QR, iniciar sessão
+    // Iniciar sessão se necessário
     if (!clinQrCode && clinStatus !== 'connecting') {
+      manualDisconnect = false
       startClinSession().catch(console.error)
     }
 
-    // Esperar QR (até 10s)
-    for (let i = 0; i < 20; i++) {
+    // Esperar QR (até 15s)
+    for (let i = 0; i < 30; i++) {
       if (clinQrCode || clinStatus === 'connected') break
       await new Promise(r => setTimeout(r, 500))
     }
@@ -275,7 +322,6 @@ export function setupClinRoutes(app: Express) {
       return res.json({ status: 'connected', qr: null, phone_number: clinPhoneNumber })
     }
 
-    // Gerar QR como base64 data URI
     if (clinQrCode) {
       try {
         const QRCode = await import('qrcode')
@@ -289,22 +335,24 @@ export function setupClinRoutes(app: Express) {
     res.json({ status: clinStatus, qr: null })
   })
 
-  // Conectar (POST)
-  app.post('/clin/connect', async (req, res) => {
+  app.post('/clin/connect', async (_req, res) => {
+    manualDisconnect = false
     if (clinStatus === 'connected') {
       return res.json({ status: 'connected', phone_number: clinPhoneNumber })
     }
     startClinSession().catch(console.error)
-    res.json({ status: 'connecting', message: 'Iniciando sessão. Acesse /clin/qr para obter o QR Code.' })
+    res.json({ status: 'connecting', message: 'Iniciando. Acesse /clin/qr para QR Code.' })
   })
 
-  // Desconectar (POST)
-  app.post('/clin/disconnect', async (req, res) => {
+  app.post('/clin/disconnect', async (_req, res) => {
+    manualDisconnect = true // Bloqueia reconexão automática
+    stopKeepAlive()
+
     if (clinSocket) {
       try {
         await clinSocket.logout()
       } catch {
-        try { clinSocket.end(undefined) } catch { /* best effort */ }
+        try { clinSocket.end(undefined) } catch { /* */ }
       }
     }
 
@@ -312,9 +360,9 @@ export function setupClinRoutes(app: Express) {
     clinStatus = 'disconnected'
     clinPhoneNumber = null
     clinQrCode = null
+    reconnectAttempt = 0
     conversations.clear()
 
-    // Limpar auth
     if (fs.existsSync(AUTH_DIR)) {
       fs.rmSync(AUTH_DIR, { recursive: true, force: true })
     }
@@ -322,14 +370,14 @@ export function setupClinRoutes(app: Express) {
     res.json({ status: 'disconnected' })
   })
 
-  console.log(`[Clin] 📡 Rotas HTTP registradas: /clin/status, /clin/qr, /clin/connect, /clin/disconnect`)
+  console.log(`[Clin] 📡 Rotas: /clin/status, /clin/qr, /clin/connect, /clin/disconnect`)
 }
 
 // ========== AUTO-START ==========
 export function initClin() {
-  // Se já tem auth salvo, reconectar automaticamente
+  manualDisconnect = false
   if (fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) {
-    console.log(`[Clin] 🔄 Auth state encontrado, reconectando...`)
+    console.log(`[Clin] 🔄 Auth encontrado — reconectando automaticamente...`)
     startClinSession().catch(console.error)
   } else {
     console.log(`[Clin] ⏳ Aguardando conexão via /clin/connect ou /clin/qr`)
